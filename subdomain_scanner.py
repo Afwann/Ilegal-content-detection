@@ -1,59 +1,60 @@
 import time
-import sublist3r
+import subprocess
 import os
 import shutil
-from dotenv import load_dotenv 
+from dotenv import load_dotenv
 
 class SubdomainScanner:
-    def __init__(self, domain, output_file, max_threads=16):
+    def __init__(self, domain, output_file, directory):
         self.domain = domain
         self.output_file = output_file
-        self.max_threads = max_threads
+        self.directory = directory
 
+    # Amass
     def enum_subdomain(self):
         try:
-            sublist3r.main(
-                self.domain, 
-                self.max_threads, 
-                self.output_file, 
-                ports="80,443", 
-                silent=True, 
-                verbose=True, 
-                enable_bruteforce=True, 
-                engines=None
-            )
-        except Exception as e:
-            print(f"An error occurred: {str(e)}")
+            print(f"Starting Amass scan for domain: {self.domain}")
+            
+            command = f"amass enum -d {self.domain}  -p 80,443 -active -brute -oA {self.output_file} -dir {self.directory} "
+            subprocess.run(command, shell=True, check=True)
+
+            print(f"Amass scan completed for domain: {self.domain}")
+        except subprocess.CalledProcessError as e:
+            print(f"An error occurred during the Amass scan: {str(e)}")
 
     def check_output(self):
-        if os.path.exists(self.output_file):
-            with open(self.output_file, 'r') as file:
-                content = file.read()
-            
-            if content:
-                print(f"\nSubdomains have been saved to {self.output_file}")
+        # Generate output file names based on the base name
+        base_name = os.path.splitext(self.output_file)[0]
+        output_files = [f"{base_name}.txt", f"{base_name}.json"]
 
-                new_directory = 'subdomain'
-                os.makedirs(new_directory, exist_ok=True)
-                new_file_path = os.path.join(new_directory, os.path.basename(self.output_file))
-                
-                shutil.move(self.output_file, new_file_path)
-                print(f"File moved to {new_file_path}")
-                
+        # Check for each output file
+        for file_name in output_files:
+            if os.path.exists(file_name):
+                with open(file_name, 'r') as file:
+                    content = file.read()
+
+                if content:
+                    print(f"\nSubdomains have been saved to {file_name}")
+
+                    new_directory = 'subdomain_output/ub_ac_id'
+                    os.makedirs(new_directory, exist_ok=True)
+                    new_file_path = os.path.join(new_directory, os.path.basename(file_name))
+
+                    shutil.move(file_name, new_file_path)
+                    print(f"File moved to {new_file_path}")
+                else:
+                    print(f"The file {file_name} exists but is empty.")
             else:
-                print(f"The file {self.output_file} exists but is empty.")
-        else:
-            print(f"Failed to save subdomains to {self.output_file}")
-
+                print(f"Failed to save subdomains to {file_name}")
 # Usage
 if __name__ == "__main__":
     load_dotenv()
 
-    domain = os.getenv("DOMAIN")
+    domain = os.getenv("DOMAIN") 
     output_file = os.getenv("OUTPUT_FILE")
-    max_threads = int(os.getenv("MAX_THREADS"))
-
-    scanner = SubdomainScanner(domain, output_file, max_threads)
+    directory = os.getenv("DIRECTORY")
+    
+    scanner = SubdomainScanner(domain, output_file, directory)
     scanner.enum_subdomain()
-    time.sleep(5) # Wait for the output to be printed in console
+    time.sleep(5)
     scanner.check_output()
