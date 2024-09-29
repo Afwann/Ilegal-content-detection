@@ -1,6 +1,2 @@
-sublist3r
-requests
-dnspython
-argparse
-
 python-dotenv
+scrapy
