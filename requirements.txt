@@ -1,2 +1,3 @@
 python-dotenv
 scrapy
+elasticsearch=8.15.1
