@@ -3,3 +3,4 @@ venv
 subdomain_output
 __pycache__
 es.py
+http_ca.crt

@@ -5,17 +5,21 @@ import scrapy
 from scrapy.crawler import CrawlerProcess
 import logging
 from urllib.parse import urlsplit, urlunsplit
-import re
+from elasticsearch import Elasticsearch, helpers
+from dotenv import load_dotenv
 
+
+load_dotenv()
 
 class SubdomainSpider(scrapy.Spider):
     name = 'subdomain_spider'
 
-    def __init__(self, subdomains):
+    def __init__(self, subdomains, es_client, es_index):
         self.start_urls = [self.normalize_url(f"https://{subdomain.strip()}") for subdomain in subdomains]
         self.allowed_domains = [subdomain.strip() for subdomain in subdomains]
         self.visited_urls = set()
-        # self.keywords = ['judi', 'gacor', 'togel', 'toto', '4d', 'bandar', 'mix parlay', 'sbobet', 'onlyfans', 'pragmatic', 'bonanza', 'zeus', 'slot']
+        self.es_client = es_client 
+        self.es_index = es_index 
         logging.info(f"Start URLs: {self.start_urls}")
         logging.info(f"Allowed Domains: {self.allowed_domains}")
 
@@ -32,6 +36,13 @@ class SubdomainSpider(scrapy.Spider):
                 logging.warning(f"HTTPS failed, trying HTTP: {http_url}")
                 return scrapy.Request(http_url, callback=self.parse)
         return None
+    
+    def is_malformed_url(self, url):
+        parsed_url = urlsplit(url)
+        if '/http/' in parsed_url.path or '/https/' in parsed_url.path:
+            logging.warning(f"Malformed URL detected with '/http/' or '/https/': {url}")
+            return True
+        return False
 
     def parse(self, response):
         normalized_url = self.normalize_url(response.url)
@@ -47,33 +58,111 @@ class SubdomainSpider(scrapy.Spider):
         self.visited_urls.add(normalized_url)
         logging.info(f"Visiting: {normalized_url}")
 
-        page_content = response.text.lower()
-        # keywords_found = [keyword for keyword in self.keywords if re.search(rf'\b{re.escape(keyword)}\b', page_content)]
 
-        # if keywords_found:
+        page_content = response.text.lower()
         page_title = response.css('title::text').get(default='No title found')
-        yield {'url': normalized_url, 'title': page_title, 'content' : page_content}
+
+        internal_links = set()
+        external_links = set()
+
 
         links = response.css('a::attr(href)').getall()
         for link in links:
             absolute_url = response.urljoin(link)
             normalized_link = self.normalize_url(absolute_url)
+
+            if self.is_malformed_url(normalized_link):
+                logging.warning(f"Skipping malformed internal/external URL: {normalized_link}")
+                continue
+
+
+
             if self.is_valid_url(normalized_link) and normalized_link not in self.visited_urls:
-                logging.info(f"Following link: {normalized_link}")
-                yield response.follow(normalized_link, callback=self.parse)
+                if self.is_internal_link(normalized_link):
+                    internal_links.add(normalized_link)
+                    logging.info(f"Following internal link: {normalized_link}")
+                    yield response.follow(normalized_link, callback=self.parse)
+                else:
+                    external_links.add(normalized_link)
+                    logging.info(f"Found external link: {normalized_link}")
+
+
+        doc = {
+            'url': normalized_url,
+            'title': page_title,
+            'content': page_content,
+            'internal_links': list(internal_links),
+            'external_links': list(external_links)
+        }
+
+        scrapy_json = {
+            'url': normalized_url,
+            'title': page_title,
+            # 'content': page_content,
+            'internal_links': list(internal_links),
+            'external_links': list(external_links)
+        }
+
+
+       
+        yield scrapy_json
+
+        
+        self.index_data_elasticsearch(doc)
+
+    def index_data_elasticsearch(self, data):
+        try:
+
+            if not self.es_client.indices.exists(index=self.es_index):
+                mapping = {
+                    "mappings": {
+                        "properties": {
+                            "url": {"type": "text"},
+                            "title": {"type": "text"},
+                            "content": {"type": "text"},
+                            "internal_links": {"type": "keyword"},
+                            "external_links": {"type": "keyword"}
+                        }
+                    }
+                }
+                self.es_client.indices.create(index=self.es_index, body=mapping)
+                logging.info(f"Created index with mapping: {self.es_index}")
+
+            self.es_client.index(index=self.es_index, body=data)
+            logging.info(f"Data indexed in Elasticsearch: {data['url']}")
+        except Exception as e:
+            logging.error(f"Failed to index data into Elasticsearch: {str(e)}")
 
     def is_valid_url(self, url):
         return url.startswith("http") and not (url.startswith("mailto:") or url.startswith("javascript:") or url.startswith("tel:"))
 
+    def is_internal_link(self, url):
+        parsed_url = urlsplit(url)
+        domain = parsed_url.netloc
+        return any(subdomain in domain for subdomain in self.allowed_domains)
+
 
 class SubdomainScannerBase:
-    def __init__(self, domain, output_file, directory):
+    def __init__(self, domain, output_file, directory, es_host=None, es_port=0, es_scheme=None, es_username=None, es_password=None):
         self.domain = domain
         self.output_file = output_file
         self.directory = directory
 
+        es_host = es_host or os.getenv("ES_HOST")
+        es_port = es_port or int(os.getenv("ES_PORT"))
+        es_scheme = es_scheme or os.getenv("ES_SCHEME")
+        es_username = es_username or os.getenv("ES_USERNAME")
+        es_password = es_password or os.getenv("ES_PASSWORD")
+
+        self.es_client = Elasticsearch([{
+            "host": es_host, "port": es_port, "scheme": es_scheme
+        }], basic_auth=(es_username, es_password), ca_certs="http_ca.crt")
+
+        self.es_index = f"{domain.replace('.', '_')}_index" if domain else "manual_index"
+
     def check_output(self):
         base_name = os.path.splitext(self.output_file)[0]
+        
         output_files = [f"{base_name}.txt", f"{base_name}.json"]
 
         for file_name in output_files:
@@ -101,17 +190,11 @@ class SubdomainScannerBase:
             'LOG_LEVEL': 'INFO',
             'RETRY_TIMES': 5,
             'USER_AGENT': 'Mozilla/5.0 (compatible; ScrapyBot/1.0; +http://example.com)',
-            'DUPEFILTER_DEBUG': True,
-            'RANDOM_UA_PER_PROXY': True,
-            'USER_AGENTS': [
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3',
-                'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:54.0) Gecko/20100101 Firefox/54.0',
-                'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/44.0.2403.157 Safari/537.36',
-            ]
+            'DUPEFILTER_DEBUG': True
         })
 
         logging.info(f"Starting Scrapy Spider for {len(subdomains)} subdomains")
-        process.crawl(SubdomainSpider, subdomains=subdomains)
+        process.crawl(SubdomainSpider, subdomains=subdomains, es_client=self.es_client, es_index=self.es_index)
         process.start()
 
 
@@ -141,20 +224,24 @@ if __name__ == "__main__":
     dns_auto = input("Do you want to Automate DNS Enum? [Y/n]? ").lower()
 
     if dns_auto == 'n':
-        # Mode manual
+        # Manual mode
         subdomains_file = input("Enter the path to the .txt file with the list of subdomains: ")
+        domain = input("Enter the domain for indexing: ")
         file_name_without_ext = os.path.splitext(os.path.basename(subdomains_file))[0].replace('.', '_')
-        output_file = f"{file_name_without_ext}_output.json"
-        directory = os.path.join("subdomain_output", "manual", file_name_without_ext)  # Folder manual
-        scanner = ManualSubdomainScanner(None, output_file, directory)
-        new_file_path = scanner.move_subdomain_file(subdomains_file)
-        scanner.start_spider(new_file_path)
+        output_file = f"output/{file_name_without_ext}_output"
+        output_directory = f"subdomain_output/manual/{domain.replace('.', '_')}/"
+
+        scanner = ManualSubdomainScanner(domain=domain, output_file=output_file, directory=output_directory)
+        moved_file_path = scanner.move_subdomain_file(subdomains_file)
+        scanner.start_spider(moved_file_path)
+
     else:
-        # Mode otomatis
-        domain = input("Enter the domain: ")
-        output_file = f"{domain.replace('.', '_')}_output"
-        directory = os.path.join("subdomain_output", "automate", domain.replace('.', '_'))  # Folder automate
-        scanner = AutoSubdomainScanner(domain, output_file, directory)
+        # Automatic mode
+        domain = input("Enter the domain you want to scan: ")
+        output_file = f"output/{domain.replace('.', '_')}_output"
+        output_directory = f"subdomain_output/manual/{domain.replace('.', '_')}/"
+
+        scanner = AutoSubdomainScanner(domain=domain, output_file=output_file, directory=output_directory)
         scanner.enum_subdomain()
         scanner.check_output()
-        scanner.start_spider(f"{scanner.directory}/{scanner.output_file}.txt")
+        scanner.start_spider(output_file + ".txt")
